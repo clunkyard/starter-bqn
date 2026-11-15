@@ -4,6 +4,12 @@
 # with shots whose power suits the range, fires only when the turret is on
 # target, keeps battery back for driving and keeps out of the storm.
 #
+# Bearing is earned: a scan contact's bearing is off by up to its
+# bearingError (degrees, a fixed share of the arc), so a wide beam finds a
+# robot and a narrow one aims at it. The robot narrows the beam, holds it
+# on the target and aims along a line fitted through its recent sightings.
+# Contacts within 120 units are exact.
+#
 # The trade-offs (game has the numbers from hello):
 #   scan     a narrow arc reaches further; a wide one finds robots nearby
 #   power    heavy shots hit harder for less battery, but fly slowly
@@ -58,7 +64,15 @@
 cy ← ⊑•args
 
 searchTurn ← 0.33  # enough to turn against the brake in the force rulesets
+searchArc ← 40     # degrees: sweeps the circle in half a second
+holdWidth ← 60     # units across at the target: it stays in the beam from tick to tick
+minArc ← 6         # degrees: the narrowest the beam holds
+window ← 12        # ticks of sightings the aim averages
+sightings ← 8      # narrow sightings in the window before a shot
+lookEvery ← 40     # ticks between looks around the target, for a nearer robot
+reacquireTicks ← 10  # ticks to look again where a lost target was
 free ← 0           # flying free, robots may be above or below
+slot ← 0           # the last target's slot, for looking again where it was lost
 # Dodges taken, and the tick the current one ends.
 dodges ← 0 ⋄ dodgeEnd ← 0
 
@@ -67,17 +81,54 @@ Start ⇐ {𝕊 game: free ↩ ("3d"≡game.match.mode)∧0=2⊑game.arena.gravi
 # The turn from heading h toward heading b, full once it is per degrees away.
 Toward ← {h‿per 𝕊 b: cy.Clamp per÷˜b cy.AngleDiff h}
 
+# A straight line through the narrowest of the last window ticks' sightings:
+# ⟨where the robot is now, how fast it moves, how many sightings it rests on⟩,
+# or @ for fewer than two. Each sighting is off by its bearingError; the line
+# averages that out. Positions form a table, a row each, so one sum fits all three axes.
+Fit ← {tick‿rate 𝕊 slot:
+  history ← cy.TrackerHistory slot
+  recent ← ((tick-window)<{𝕩.tick}¨history)/history
+  error ← {𝕩.bearingError}¨recent
+  seen ← (error≤1.5×⌊´error)/recent  # the narrow ones
+  {2>≠seen ? @ ;
+    ticks ← {𝕩.tick}¨seen ⋄ t0 ← (+´ticks)÷≠seen
+    dt ← ticks-t0
+    positions ← >{𝕩.position}¨seen
+    slope ← (+˝dt×positions)÷+´dt×dt  # per tick: the ticks about their mean sum to zero
+    ⟨((+˝positions)÷≠seen)+slope×tick-t0, slope×rate, ≠seen⟩}
+}
+
 Track ← {game‿state 𝕊 c:
-  me ← state.self ⋄ range ← c.range
+  me ← state.self ⋄ range ← c.range ⋄ slot ↩ c.slot
   drive ← cy.Drive ⟨((range>350)+2×range<200)⊑0.2‿0.7‿¯0.4, me.heading‿45 Toward c.bearing, cy.Clamp 45÷˜c.elevation-me.pitch⟩
-  scan ← cy.Scan c.bearing‿20‿c.elevation  # narrow: holds it, reaching about 735
+  # Halve the beam each tick until it is holdWidth across at the target: narrow
+  # enough for a precise bearing, wide enough to keep it in. In a crowd a narrow
+  # beam sees one robot: every lookEvery ticks, widen it for a tick, and a
+  # nearer robot it finds becomes the target.
+  hold ← minArc⌈(360÷π)×•math.Atan (holdWidth÷2)÷range
+  arc ← {0=lookEvery|state.tick ? searchArc ; hold⌈searchArc⌊2÷˜state.scan.arc}
+  scan ← cy.Scan c.bearing‿arc‿c.elevation
   # The heaviest shot that still covers the range in about a second, aimed
   # where the target will be, lobbed under gravity.
   power ← game cy.PowerForFlightTime range
-  # cy.Lead is the intercept if the target holds course.
-  h‿p ← 2↑(game‿state cy.Lead ⟨state cy.Position c, c.velocity, power⟩)∾c.bearing‿c.elevation
+  # An exact contact: cy.Lead is the intercept if the target holds course. A
+  # noisy one: lead the fitted line, and fire only once it rests on enough sightings.
+  noisy ← 0<c.bearingError
+  line ← {noisy ? ⟨state.tick, game.match.tickRate⟩ Fit c.slot ; @}
+  ready ← (¬noisy)∨{@≡line ? 0 ; sightings≤2⊑line}
+  aim ← {noisy ? {@≡line ? ⟨⟩ ; game‿state cy.Lead (2↑line)∾⟨power⟩} ; game‿state cy.Lead ⟨state cy.Position c, c.velocity, power⟩}
+  h‿p ← 2↑aim∾c.bearing‿c.elevation
   onTarget ← (3>|h cy.AngleDiff me.aim.heading)∧3>|p-me.aim.pitch
-  drive∾scan∾(cy.Aim h‿p)∾((onTarget∧game‿state cy.CanFire power‿10)/cy.Fire power)∾"TRACK" cy.Status range
+  drive∾scan∾(cy.Aim h‿p)∾((ready∧onTarget∧game‿state cy.CanFire power‿10)/cy.Fire power)∾(ready⊑"NARROW"‿"TRACK") cy.Status range
+}
+
+# Lost it: look again where it was last seen, widening the beam, before searching.
+Reacquire ← {game‿state 𝕊 remembered:
+  me ← state.self
+  where ← (@≡remembered)⊑remembered‿me.position
+  bearing ← me.position cy.BearingTo where
+  elevation ← free×me.position cy.ElevationTo where
+  (cy.Drive ⟨0.5, me.heading‿45 Toward bearing, cy.Clamp 45÷˜elevation-me.pitch⟩)∾(cy.Scan ⟨bearing, searchArc⌊2×state.scan.arc, elevation⟩)∾cy.Status "REACQUIRE"
 }
 
 # Head for where it was heard, sweeping an arc that still reaches it across
@@ -95,13 +146,16 @@ FollowCue ← {game‿state 𝕊 cue:
 
 # Sweeps the circle in half a second, flying free at three heights in turn.
 Sweep ← {game‿state 𝕊 x:
-  (cy.Drive ⟨0.5, searchTurn, cy.Clamp 45÷˜-state.self.pitch⟩)∾(cy.Scan ⟨360|state.scan.heading+36, 40, free×35×1-˜3|⌊state.tick÷10⟩)∾cy.Status "SEARCH"
+  (cy.Drive ⟨0.5, searchTurn, cy.Clamp 45÷˜-state.self.pitch⟩)∾(cy.Scan ⟨360|state.scan.heading+36, searchArc, free×35×1-˜3|⌊state.tick÷10⟩)∾cy.Status "SEARCH"
 }
 
 Turn ⇐ {game 𝕊 state:
   me ← state.self ⋄ t ← cy.Nearest state
+  seen ← {0=slot ? @ ; cy.TrackerLastSeen slot}
+  lost ← {@≡seen ? 0 ; reacquireTicks≥state.tick-seen}
   act ← ("brake" cy.Set 0.2)∾{
     0≤t ? game‿state Track t⊑state.contacts ;
+    lost ? game‿state Reacquire cy.TrackerPosition slot ;
     state.hasCue ? game‿state FollowCue state.cue ;
     game‿state Sweep @
   }
