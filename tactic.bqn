@@ -19,7 +19,8 @@
 # clock: tick seconds remaining_ticks
 # arena: size gravity terrain_kind ground_height(x y)
 # me: health position velocity heading pitch roll angular_velocity
-#   attitude grounded altitude applied
+#   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+#   from_mount(heading pitch) mount_toward(point)
 # battery: charge capacity regen sustainable_drive compute
 #   drive_cost(fraction)
 # drive: hover_lift
@@ -41,7 +42,8 @@
 # score: me best armour
 # angles: normalize(degrees) angle_diff(target current)
 #   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-#   distance(a b) clamp(value low high)
+#   distance(a b) to_chassis(heading pitch attitude)
+#   from_chassis(heading pitch attitude) clamp(value low high)
 # raw: number(path) text(path) has(path) flag(path) count(path) line()
 # Controls: drive.set(throttle turn pitch_turn)
 #   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -57,6 +59,8 @@ cy ← ⊑•args
 
 searchTurn ← 0.33  # enough to turn against the brake in the force rulesets
 free ← 0           # flying free, robots may be above or below
+# Dodges taken, and the tick the current one ends.
+dodges ← 0 ⋄ dodgeEnd ← 0
 
 Start ⇐ {𝕊 game: free ↩ ("3d"≡game.match.mode)∧0=2⊑game.arena.gravity}
 
@@ -70,6 +74,7 @@ Track ← {game‿state 𝕊 c:
   # The heaviest shot that still covers the range in about a second, aimed
   # where the target will be, lobbed under gravity.
   power ← game cy.PowerForFlightTime range
+  # cy.Lead is the intercept if the target holds course.
   h‿p ← 2↑(game‿state cy.Lead ⟨state cy.Position c, c.velocity, power⟩)∾c.bearing‿c.elevation
   onTarget ← (3>|h cy.AngleDiff me.aim.heading)∧3>|p-me.aim.pitch
   drive∾scan∾(cy.Aim h‿p)∾((onTarget∧game‿state cy.CanFire power‿10)/cy.Fire power)∾"TRACK" cy.Status range
@@ -100,6 +105,13 @@ Turn ⇐ {game 𝕊 state:
     state.hasCue ? game‿state FollowCue state.cue ;
     game‿state Sweep @
   }
+  # A simple dodge: vary it, or predict the shooter. A shot heard once the
+  # last dodge is over starts the next for 10 ticks.
+  {(state.tick≥dodgeEnd)∧∨´{"muzzle"≡𝕩.source}¨state.contacts ? dodges +↩ 1 ⋄ dodgeEnd ↩ state.tick+10 ; @}
+  # Off the line of fire: left, then right next time (turn is positive left, strafe positive right).
+  side ← ¯1⋆1+2|dodges  # 1 left, ¯1 right
+  move ← {"forces"≡game.match.control ? (cy.Drive ⟨0.5⟩)∾"strafe" cy.Set -side ; cy.Drive 1‿side}
+  act ∾↩ (state.tick<dodgeEnd)/move∾("dodge:"∾(side=1)⊑"right"‿"left") cy.Status dodges
   # Low battery: drive gently so the shots can still be paid for.
   act ∾↩ (me.battery<game.battery.capacity÷4)/cy.Drive 0.5×act cy.Get "throttle"
   # The storm hurts inside: drive straight away from its centre.
